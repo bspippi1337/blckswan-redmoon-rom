@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_ref:
-        description: "Motorola kernel branch/tag (leave default unless overriding)"
+        description: "Motorola kernel branch/tag"
         required: true
         default: "android-15-release"
       defconfig:
@@ -12,7 +12,7 @@ on:
         required: true
         default: "gki_defconfig"
       oc_percent:
-        description: "Requested OC percentage (max 20)"
+        description: "Requested OC percentage, max 20"
         required: true
         default: "15"
 
@@ -22,25 +22,31 @@ jobs:
 
     steps:
       - name: Install build dependencies
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             git bc bison flex make rsync zip unzip lz4 cpio \
             python3 python3-pip \
-            clang llvm lld \
             libssl-dev libc6-dev libncurses-dev dwarves
+
+      - name: Install Android kernel clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilts
+          CLANG_DIR="$(find clang-prebuilts/clang-r* -maxdepth 0 -type d | sort -V | tail -n1)"
+          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "$CLANG_DIR/bin/clang" --version
 
       - name: Checkout Motorola kernel
         shell: bash
         run: |
           set -euo pipefail
-
           REPO="https://github.com/MotorolaMobilityLLC/kernel-mtk.git"
           REQUESTED="${{ github.event.inputs.kernel_ref }}"
-
           rm -rf kernel
-
-          echo "::group::Finding kernel ref"
 
           if git ls-remote --heads "$REPO" "$REQUESTED" | grep -q .; then
             REF="$REQUESTED"
@@ -52,68 +58,39 @@ jobs:
               | awk '{print $2}' \
               | sed 's#refs/heads/##;s#refs/tags/##' \
               | grep -Ei 'lamu|android.?15|vvta|vta35|g15' \
-              | head -n1
+              | head -n1 || true
             )"
-
-            if [ -z "$REF" ]; then
-              echo "Unable to locate a matching kernel branch/tag."
-              echo
-              echo "Available refs:"
-              git ls-remote --heads --tags "$REPO" \
-                | awk '{print $2}' \
-                | sed 's#refs/heads/##;s#refs/tags/##' \
-                | sort
-              exit 1
-            fi
+            [ -n "$REF" ] || { echo "No matching Motorola kernel ref found"; exit 1; }
           fi
 
           echo "Using ref: $REF"
-          echo "::endgroup::"
-
           git clone --depth=1 --branch "$REF" "$REPO" kernel
 
-      - name: Apply Red Moon patch
+      - name: Apply Red Moon OC patch
         shell: bash
         run: |
           cat > redmoon_safe_oc.py <<'PY'
-          import os
-          import re
-          import sys
+          import os, re, sys
 
           pct = int(sys.argv[1])
-
           if pct < 1:
               print("OC disabled")
               sys.exit(0)
-
           if pct > 20:
-              raise SystemExit("Requested OC exceeds configured limit (20%).")
+              raise SystemExit("Requested OC exceeds configured limit 20%")
 
           root = "kernel"
-
-          skip = (
-              "thermal",
-              "cooling",
-              "trip",
-              "power_allocator",
-          )
-
-          rx = re.compile(
-              r'(\b(?:opp-hz|freq|clock-frequency)\s*=\s*<[^;]*?)(\d{6,10})([^;]*?>;)'
-          )
-
+          skip = ("thermal", "cooling", "trip", "power_allocator")
+          rx = re.compile(r'(\b(?:opp-hz|freq|clock-frequency)\s*=\s*<[^;]*?)(\d{6,10})([^;]*?>;)')
           touched = []
 
           for d, _, files in os.walk(root):
               if any(s in d.lower() for s in skip):
                   continue
-
               for f in files:
                   if not f.endswith((".dts", ".dtsi")):
                       continue
-
                   path = os.path.join(d, f)
-
                   if any(s in path.lower() for s in skip):
                       continue
 
@@ -126,21 +103,17 @@ jobs:
                       val = int(m.group(2))
                       if val < 100000:
                           return m.group(0)
-
                       new = int(val * (100 + pct) / 100)
                       return f"{m.group(1)}{new}{m.group(3)}"
 
                   patched = rx.sub(repl, txt)
-
                   if patched != txt:
-                      with open(path, "w") as fp:
-                          fp.write(patched)
+                      open(path, "w").write(patched)
                       touched.append(path)
 
           print(f"Patched {len(touched)} files")
-
           if not touched:
-              print("WARNING: No OPP/devfreq tables matched.")
+              print("WARNING: No OPP/devfreq tables matched")
           PY
 
           python3 redmoon_safe_oc.py "${{ github.event.inputs.oc_percent }}"
@@ -151,36 +124,50 @@ jobs:
         run: |
           export ARCH=arm64
           export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export PATH="$CLANG_DIR/bin:$PATH"
           make O=out "${{ github.event.inputs.defconfig }}"
 
       - name: Build kernel
         working-directory: kernel
         shell: bash
         run: |
+          set +e
           export ARCH=arm64
           export LLVM=1
-          make O=out -j"$(nproc)" Image.gz dtbs modules | tee ../kernel-build.log
+          export LLVM_IAS=1
+          export CC=clang
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export PATH="$CLANG_DIR/bin:$PATH"
+
+          make O=out -j"$(nproc)" Image.gz dtbs modules 2>&1 | tee ../kernel-build.log
+          STATUS=${PIPESTATUS[0]}
+
+          echo "===== FIRST REAL ERRORS ====="
+          grep -nEi "error:|fatal:|undefined reference|No rule to make target|not found|No such file|Stop\.|failed" ../kernel-build.log | head -n 120 || true
+
+          echo "===== LAST 200 LINES ====="
+          tail -n 200 ../kernel-build.log || true
+
+          exit "$STATUS"
 
       - name: Collect artifacts
+        if: always()
         shell: bash
         run: |
           mkdir -p artifacts
-
-          find kernel/out -type f \
-            \( \
-              -name Image \
-              -o -name Image.gz \
-              -o -name "*.dtb" \
-              -o -name "*.dtbo" \
-              -o -name "*.ko" \
-            \) \
-            -exec cp --parents {} artifacts/ \;
-
-          cp kernel-build.log artifacts/
-
-          zip -r BLCKSWAN_G15_RED_MOON_KERNEL_ARTIFACTS.zip artifacts
+          [ -d kernel/out ] && find kernel/out -type f \
+            \( -name Image -o -name Image.gz -o -name "*.dtb" -o -name "*.dtbo" -o -name "*.ko" \) \
+            -exec cp --parents {} artifacts/ \; || true
+          [ -f kernel-build.log ] && cp kernel-build.log artifacts/ || true
+          zip -r BLCKSWAN_G15_RED_MOON_KERNEL_ARTIFACTS.zip artifacts || true
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: BLCKSWAN_G15_RED_MOON_KERNEL
