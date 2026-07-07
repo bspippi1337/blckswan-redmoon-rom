@@ -1,0 +1,138 @@
+name: BLCKSWAN G15 Red Moon Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Motorola kernel-mtk branch/tag/commit for lamu"
+        required: true
+        default: "android-15-release"
+      defconfig:
+        description: "Kernel defconfig"
+        required: true
+        default: "gki_defconfig"
+      oc_percent:
+        description: "Safe OC percent, max 20"
+        required: true
+        default: "15"
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt update
+          sudo apt install -y git bc bison flex libssl-dev make libc6-dev \
+            libncurses5-dev cpio python3 python3-pip unzip zip rsync lz4 \
+            dwarves clang llvm
+
+      - name: Checkout Motorola MTK kernel
+        run: |
+          rm -rf kernel
+          git clone --depth=1 --branch "${{ github.event.inputs.kernel_ref }}" \
+            https://github.com/MotorolaMobilityLLC/kernel-mtk.git kernel || {
+              rm -rf kernel
+              git clone https://github.com/MotorolaMobilityLLC/kernel-mtk.git kernel
+            }
+
+      - name: Add Red Moon safe OC patcher
+        run: |
+          cat > redmoon_safe_oc.py <<'PY'
+          import os, re, sys
+
+          pct = int(sys.argv[1])
+          if pct < 1:
+              print("[!] OC disabled")
+              sys.exit(0)
+          if pct > 20:
+              raise SystemExit("[!] Refusing unsafe OC > 20%")
+
+          root = "kernel"
+          touched = []
+
+          skip_words = ("thermal", "cooling", "trip", "power_allocator")
+
+          rx = re.compile(r'(\b(?:opp-hz|freq|clock-frequency)\s*=\s*<[^;]*?)(\d{6,10})([^;]*?>;)')
+
+          for dirpath, _, files in os.walk(root):
+              lowdir = dirpath.lower()
+              if any(w in lowdir for w in skip_words):
+                  continue
+
+              for fn in files:
+                  if not fn.endswith((".dts", ".dtsi")):
+                      continue
+
+                  path = os.path.join(dirpath, fn)
+                  low = path.lower()
+
+                  if any(w in low for w in skip_words):
+                      continue
+
+                  try:
+                      data = open(path, "r", errors="ignore").read()
+                  except Exception:
+                      continue
+
+                  def bump(m):
+                      n = int(m.group(2))
+
+                      if n < 100000:
+                          return m.group(0)
+
+                      new = int(n * (100 + pct) / 100)
+                      return f"{m.group(1)}{new}{m.group(3)}"
+
+                  newdata = rx.sub(bump, data)
+
+                  if newdata != data:
+                      open(path, "w").write(newdata)
+                      touched.append(path)
+
+          print("[+] Red Moon OC percent:", pct)
+          print("[+] Patched files:")
+
+          for x in touched:
+              print(" -", x)
+
+          if not touched:
+              print("[!] No OPP/devfreq DTS tables matched. Kernel source layout may not expose OC tables.")
+          PY
+
+          python3 redmoon_safe_oc.py "${{ github.event.inputs.oc_percent }}"
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export LLVM=1
+          make O=out ${{ github.event.inputs.defconfig }}
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export LLVM=1
+          make O=out -j"$(nproc)" Image.gz dtbs modules 2>&1 | tee ../kernel-build.log
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          find kernel/out -type f \( \
+            -name "Image" -o \
+            -name "Image.gz" -o \
+            -name "*.dtb" -o \
+            -name "*.dtbo" -o \
+            -name "*.ko" \
+          \) -exec cp --parents {} artifacts/ \;
+
+          cp kernel-build.log artifacts/
+          zip -r BLCKSWAN_G15_RED_MOON_KERNEL_ARTIFACTS.zip artifacts
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCKSWAN_G15_RED_MOON_KERNEL
+          path: BLCKSWAN_G15_RED_MOON_KERNEL_ARTIFACTS.zip
