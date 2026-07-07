@@ -1,0 +1,12 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'os.blckswan.about'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'os.blckswan.about'
+        minSdk 26
+        targetSdk 35
+        versionCode 42
+        versionName '42.0-redmoon'
+    }
+}
