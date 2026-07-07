@@ -1,4 +1,4 @@
-name: BLCKSWAN G15 Red Moon Kernel
+name: BLCKSWAN G15 Red Moon Kernel wifi mod
 
 on:
   workflow_dispatch:
@@ -25,20 +25,36 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            git bc bison flex make rsync zip unzip lz4 cpio \
-            python3 python3-pip \
-            libssl-dev libc6-dev libncurses-dev dwarves
+          sudo apt-get install -y git bc bison flex make rsync zip unzip lz4 cpio python3 python3-pip libssl-dev libc6-dev libncurses-dev dwarves
+
+      - name: Cache Android clang
+        uses: actions/cache@v4
+        with:
+          path: clang-prebuilts
+          key: android-clang-r596125
+          restore-keys: |
+            android-clang-
 
       - name: Install Android kernel clang
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilts
+          if [ ! -d clang-prebuilts/.git ]; then
+            git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilts
+          else
+            echo "Using cached Android clang"
+          fi
+
           CLANG_DIR="$(find clang-prebuilts/clang-r* -maxdepth 0 -type d | sort -V | tail -n1)"
           echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
           echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+
+          if [ ! -x "$CLANG_DIR/bin/ld.lld" ] && [ -x "$CLANG_DIR/bin/ld64.lld" ]; then
+            ln -sf ld64.lld "$CLANG_DIR/bin/ld.lld"
+          fi
+
           "$CLANG_DIR/bin/clang" --version
+          "$CLANG_DIR/bin/ld.lld" --version
 
       - name: Checkout Motorola kernel
         shell: bash
@@ -53,13 +69,7 @@ jobs:
           elif git ls-remote --tags "$REPO" "$REQUESTED" | grep -q .; then
             REF="$REQUESTED"
           else
-            REF="$(
-              git ls-remote --heads --tags "$REPO" \
-              | awk '{print $2}' \
-              | sed 's#refs/heads/##;s#refs/tags/##' \
-              | grep -Ei 'lamu|android.?15|vvta|vta35|g15' \
-              | head -n1 || true
-            )"
+            REF="$(git ls-remote --heads --tags "$REPO" | awk '{print $2}' | sed 's#refs/heads/##;s#refs/tags/##' | grep -Ei 'lamu|android.?15|vvta|vta35|g15' | head -n1 || true)"
             [ -n "$REF" ] || { echo "No matching Motorola kernel ref found"; exit 1; }
           fi
 
@@ -93,7 +103,6 @@ jobs:
                   path = os.path.join(d, f)
                   if any(s in path.lower() for s in skip):
                       continue
-
                   try:
                       txt = open(path, "r", errors="ignore").read()
                   except Exception:
@@ -103,46 +112,101 @@ jobs:
                       val = int(m.group(2))
                       if val < 100000:
                           return m.group(0)
-                      new = int(val * (100 + pct) / 100)
-                      return f"{m.group(1)}{new}{m.group(3)}"
+                      return f"{m.group(1)}{int(val * (100 + pct) / 100)}{m.group(3)}"
 
                   patched = rx.sub(repl, txt)
                   if patched != txt:
                       open(path, "w").write(patched)
                       touched.append(path)
 
-          print(f"Patched {len(touched)} files")
-          if not touched:
-              print("WARNING: No OPP/devfreq tables matched")
+          print(f"Patched {len(touched)} OC files")
           PY
 
           python3 redmoon_safe_oc.py "${{ github.event.inputs.oc_percent }}"
+
+      - name: Apply Red Moon monitor injection config
+        shell: bash
+        run: |
+          cat > kernel/redmoon_wifi_monitor.config <<'EOF'
+          CONFIG_CFG80211=y
+          CONFIG_CFG80211_WEXT=y
+          CONFIG_CFG80211_CERTIFICATION_ONUS=y
+          CONFIG_CFG80211_DEBUGFS=y
+          CONFIG_NL80211_TESTMODE=y
+          CONFIG_MAC80211=y
+          CONFIG_MAC80211_LEDS=y
+          CONFIG_MAC80211_DEBUGFS=y
+          CONFIG_RFKILL=y
+          CONFIG_WIRELESS=y
+          CONFIG_WLAN=y
+          CONFIG_USB_NET_DRIVERS=y
+          CONFIG_USB_USBNET=y
+          CONFIG_USB_ANNOUNCE_NEW_DEVICES=y
+          CONFIG_NETFILTER=y
+          CONFIG_PACKET=y
+          CONFIG_BPF=y
+          CONFIG_BPF_SYSCALL=y
+          CONFIG_NET_SCH_FQ=y
+          CONFIG_NET_SCH_FQ_CODEL=y
+          CONFIG_TCP_CONG_BBR=y
+          CONFIG_WIREGUARD=m
+          CONFIG_MT76=m
+          CONFIG_MT76_USB=m
+          CONFIG_MT7601U=m
+          CONFIG_MT76x0U=m
+          CONFIG_MT76x2U=m
+          CONFIG_MT7615E=m
+          CONFIG_MT7921U=m
+          CONFIG_RTL8XXXU=m
+          CONFIG_RTL8XXXU_UNTESTED=y
+          CONFIG_ATH9K=m
+          CONFIG_ATH9K_HTC=m
+          CONFIG_CARL9170=m
+          CONFIG_ZD1211RW=m
+          EOF
 
       - name: Configure kernel
         working-directory: kernel
         shell: bash
         run: |
+          set -euo pipefail
+          export PATH="$CLANG_DIR/bin:$PATH"
           export ARCH=arm64
           export LLVM=1
           export LLVM_IAS=1
           export CC=clang
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
           export HOSTCC=clang
           export HOSTCXX=clang++
-          export PATH="$CLANG_DIR/bin:$PATH"
+
           make O=out "${{ github.event.inputs.defconfig }}"
+          ./scripts/kconfig/merge_config.sh -O out out/.config redmoon_wifi_monitor.config || true
+          make O=out olddefconfig
+          grep -E "CONFIG_(CFG80211|MAC80211|NL80211_TESTMODE|MT76|RTL8XXXU|ATH9K|WIREGUARD|TCP_CONG_BBR)" out/.config || true
 
       - name: Build kernel
         working-directory: kernel
         shell: bash
         run: |
           set +e
+          export PATH="$CLANG_DIR/bin:$PATH"
           export ARCH=arm64
           export LLVM=1
           export LLVM_IAS=1
           export CC=clang
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
           export HOSTCC=clang
           export HOSTCXX=clang++
-          export PATH="$CLANG_DIR/bin:$PATH"
 
           make O=out -j"$(nproc)" Image.gz dtbs modules 2>&1 | tee ../kernel-build.log
           STATUS=${PIPESTATUS[0]}
@@ -160,9 +224,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts
-          [ -d kernel/out ] && find kernel/out -type f \
-            \( -name Image -o -name Image.gz -o -name "*.dtb" -o -name "*.dtbo" -o -name "*.ko" \) \
-            -exec cp --parents {} artifacts/ \; || true
+          [ -d kernel/out ] && find kernel/out -type f \( -name Image -o -name Image.gz -o -name "*.dtb" -o -name "*.dtbo" -o -name "*.ko" \) -exec cp --parents {} artifacts/ \; || true
           [ -f kernel-build.log ] && cp kernel-build.log artifacts/ || true
           zip -r BLCKSWAN_G15_RED_MOON_KERNEL_ARTIFACTS.zip artifacts || true
 
