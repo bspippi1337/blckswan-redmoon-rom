@@ -25,20 +25,25 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y git bc bison flex make rsync zip unzip lz4 cpio python3 python3-pip libssl-dev libc6-dev libncurses-dev dwarves
+          sudo apt-get install -y \
+            git bc bison flex make rsync zip unzip lz4 cpio \
+            python3 python3-pip libssl-dev libc6-dev libncurses-dev \
+            dwarves ccache
 
       - name: Cache Android clang
         uses: actions/cache@v4
         with:
           path: clang-prebuilts
-          key: android-clang-r596125
+          key: android-clang-r596125-${{ hashFiles('.github/workflows/blckswan-g15-kernel.yml') }}
           restore-keys: |
+            android-clang-r596125-
             android-clang-
 
-      - name: Install Android kernel clang
+      - name: Setup build environment
         shell: bash
         run: |
           set -euo pipefail
+
           if [ ! -d clang-prebuilts/.git ]; then
             git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilts
           else
@@ -55,11 +60,13 @@ jobs:
 
           "$CLANG_DIR/bin/clang" --version
           "$CLANG_DIR/bin/ld.lld" --version
+          ccache --version
 
       - name: Checkout Motorola kernel
         shell: bash
         run: |
           set -euo pipefail
+
           REPO="https://github.com/MotorolaMobilityLLC/kernel-mtk.git"
           REQUESTED="${{ github.event.inputs.kernel_ref }}"
           rm -rf kernel
@@ -76,9 +83,11 @@ jobs:
           echo "Using ref: $REF"
           git clone --depth=1 --branch "$REF" "$REPO" kernel
 
-      - name: Apply Red Moon OC patch
+      - name: Apply Red Moon patches
         shell: bash
         run: |
+          set -euo pipefail
+
           cat > redmoon_safe_oc.py <<'PY'
           import os, re, sys
 
@@ -97,12 +106,15 @@ jobs:
           for d, _, files in os.walk(root):
               if any(s in d.lower() for s in skip):
                   continue
+
               for f in files:
                   if not f.endswith((".dts", ".dtsi")):
                       continue
+
                   path = os.path.join(d, f)
                   if any(s in path.lower() for s in skip):
                       continue
+
                   try:
                       txt = open(path, "r", errors="ignore").read()
                   except Exception:
@@ -115,6 +127,7 @@ jobs:
                       return f"{m.group(1)}{int(val * (100 + pct) / 100)}{m.group(3)}"
 
                   patched = rx.sub(repl, txt)
+
                   if patched != txt:
                       open(path, "w").write(patched)
                       touched.append(path)
@@ -124,9 +137,6 @@ jobs:
 
           python3 redmoon_safe_oc.py "${{ github.event.inputs.oc_percent }}"
 
-      - name: Apply Red Moon monitor injection config
-        shell: bash
-        run: |
           cat > kernel/redmoon_wifi_monitor.config <<'EOF'
           CONFIG_CFG80211=y
           CONFIG_CFG80211_WEXT=y
@@ -165,48 +175,39 @@ jobs:
           CONFIG_ZD1211RW=m
           EOF
 
-      - name: Configure kernel
-        working-directory: kernel
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PATH="$CLANG_DIR/bin:$PATH"
-          export ARCH=arm64
-          export LLVM=1
-          export LLVM_IAS=1
-          export CC=clang
-          export LD=ld.lld
-          export AR=llvm-ar
-          export NM=llvm-nm
-          export OBJCOPY=llvm-objcopy
-          export OBJDUMP=llvm-objdump
-          export STRIP=llvm-strip
-          export HOSTCC=clang
-          export HOSTCXX=clang++
-
-          make O=out "${{ github.event.inputs.defconfig }}"
-          ./scripts/kconfig/merge_config.sh -O out out/.config redmoon_wifi_monitor.config || true
-          make O=out olddefconfig
-          grep -E "CONFIG_(CFG80211|MAC80211|NL80211_TESTMODE|MT76|RTL8XXXU|ATH9K|WIREGUARD|TCP_CONG_BBR)" out/.config || true
-
       - name: Build kernel
         working-directory: kernel
         shell: bash
+        env:
+          ARCH: arm64
+          LLVM: "1"
+          LLVM_IAS: "1"
+          CC: clang
+          LD: ld.lld
+          AR: llvm-ar
+          NM: llvm-nm
+          OBJCOPY: llvm-objcopy
+          OBJDUMP: llvm-objdump
+          STRIP: llvm-strip
+          HOSTCC: clang
+          HOSTCXX: clang++
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           set +e
+
           export PATH="$CLANG_DIR/bin:$PATH"
-          export ARCH=arm64
-          export LLVM=1
-          export LLVM_IAS=1
-          export CC=clang
-          export LD=ld.lld
-          export AR=llvm-ar
-          export NM=llvm-nm
-          export OBJCOPY=llvm-objcopy
-          export OBJDUMP=llvm-objdump
-          export STRIP=llvm-strip
-          export HOSTCC=clang
-          export HOSTCXX=clang++
+          export CCACHE_EXEC="$(command -v ccache || true)"
+
+          make O=out "${{ github.event.inputs.defconfig }}"
+          CONF_STATUS=$?
+
+          if [ "$CONF_STATUS" -eq 0 ]; then
+            ./scripts/kconfig/merge_config.sh -O out out/.config redmoon_wifi_monitor.config || true
+            make O=out olddefconfig
+            grep -E "CONFIG_(CFG80211|MAC80211|NL80211_TESTMODE|MT76|RTL8XXXU|ATH9K|WIREGUARD|TCP_CONG_BBR)" out/.config || true
+          fi
+
+          [ "$CONF_STATUS" -eq 0 ] || exit "$CONF_STATUS"
 
           make O=out -j"$(nproc)" Image.gz dtbs modules 2>&1 | tee ../kernel-build.log
           STATUS=${PIPESTATUS[0]}
