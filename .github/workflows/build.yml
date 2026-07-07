@@ -20,6 +20,7 @@ jobs:
       - name: Pack RED MOON module
         run: |
           set -eux
+          mkdir -p module/system/product/app/BlckswanAbout module/system/product/media
           cp app/build/outputs/apk/debug/app-debug.apk module/system/product/app/BlckswanAbout/BlckswanAbout.apk
           if [ -f assets/bootanimation.zip ]; then
             cp assets/bootanimation.zip module/system/product/media/bootanimation.zip
